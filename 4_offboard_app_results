@@ -1,0 +1,637 @@
+import json
+import boto3
+import requests
+import time
+from clients.gsuite import GSuiteClient
+from clients.github import GithubClient
+from requests.auth import HTTPBasicAuth
+
+# Slack API URL
+SLACK_API = "https://slack.com/api/users.lookupByEmail"
+
+HEADERS = {
+    'Accept': 'application/json',
+    'Content-type': 'application/json',
+}
+
+log_channel = "#it-offboarding"
+# log_channel = "#test-offboarding"
+
+COMPUTER_STATUS = "[Choose a status: Locked, Erased, Active]"
+COMPUTER_LOCK_CODE = "[Enter locked code here]"
+COMPUTER_SERIAL_NUMBER = "[Enter the active Serial #]"
+SLACK_STATUS = "[suspended/active]"
+ZOOM_STATUS = "[suspended/active]"
+FORWARDING_ADDRESS = "[Enter Forwarding Address]"
+GOOGLE_ACCOUNT = "[suspended/active]"
+FORWARD_MAIL = "[yes/no]"
+FORWARD_MAIL_STATUS = "inactive"
+
+
+def lambda_handler(event, context):
+    data_from_slack = event["Records"][0]["Sns"]["Message"]
+    service_account_file = getParameter("offboarding_service_account_file")
+    gsuite = GSuiteClient(service_account_file)
+    json_slack_data = json.loads(data_from_slack)
+    summary = None
+    update = ""
+
+    print(json_slack_data)
+
+    if json_slack_data["type"] == "block_actions" or json_slack_data["type"] == "interactive_message":
+        invoker_id, invoker, channel_id, user_data = get_data(json_slack_data)
+
+        suspendGoogledic = {"action": "suspendGoogle", "function": gsuite.suspend_google, "arg": user_data['Email'],
+                            "response": ""}
+        checkforAliasesdic = {"action": "checkforAliases", "function": gsuite.check_for_aliases,
+                              "arg": user_data['Email'],
+                              "response": ""}
+        lockComputerdic = {"action": "lockComputer", "function": lockComputer, "arg": user_data,
+                           "response": ""}
+        deactivateSlackdic = {"action": "deactivateSlack", "function": deleteSlackUser, "arg": user_data["ID"],
+                              "response": ""}
+        removeGitdic = {"action": "removeGit", "function": removeGitUser, "arg": user_data['Email'], "response": ""}
+        removeZoomdic = {"action": "removeZoom", "function": deactivateZoom, "arg": user_data['Email'], "response": ""}
+        checkforSuspensiondic = {"action": "checkIfUserSuspended", "function": gsuite.check_for_suspension,
+                                 "arg": user_data['Email'],
+                                 "response": ""}
+        createFwdGrpdic = {"action": "createGroup", "function": gsuite.create_forwarding_group,
+                           "arg": user_data['Email'],
+                           "response": ""}
+        msgManagerdic = {"action": "msgManager", "function": imManager, "arg": user_data, "response": ""}
+
+        phases = [suspendGoogledic, checkforAliasesdic, lockComputerdic, deactivateSlackdic, removeGitdic,
+                  removeZoomdic, checkforSuspensiondic, createFwdGrpdic,
+                  msgManagerdic]
+
+        if json_slack_data["type"] == "interactive_message":
+            summary = one_click_termination(invoker_id, invoker, channel_id, user_data, phases)
+
+        elif json_slack_data["type"] == "block_actions":
+            action_id = json_slack_data["actions"][0]["action_id"]
+
+            if "emailForwardingYes" in action_id:
+                askManager(json_slack_data)
+            elif "emailForwardingNo" in action_id:
+                global FORWARD_MAIL, FORWARDING_ADDRESS
+
+                sendSlackMessage(log_channel,
+                                 f"Email forwarding for {user_data['Email']} was declined.")
+
+                FORWARD_MAIL = "no"
+                FORWARDING_ADDRESS = "n/a"
+                sendSlackMessage(f"@{invoker}",
+                                 f"Thank you. We received your request.")
+                update = update + get_jira_update("google_account_transfer")
+
+            elif action_id == "select_all":
+                summary = one_click_termination(invoker_id, invoker, one_click_termination, user_data, phases)
+            else:
+                step_by_step_termination(invoker_id, invoker, channel_id, user_data, action_id, gsuite)
+
+    elif json_slack_data["type"] == "dialog_submission":
+        get_dialog_submission(json_slack_data)
+
+    if summary is not None:
+        global GOOGLE_ACCOUNT
+
+        GOOGLE_ACCOUNT = gsuite.check_for_suspension(user_data['Email'])
+
+        update = update + get_jira_update("checklist")
+
+        sendHiddenSlackMessage(invoker_id, channel_id, summary)
+
+    if update != "":
+        log_in_jira(update, user_data)
+
+
+def get_data(json_slack_data):
+    invoker = json_slack_data["user"]["name"]
+    invoker_id = json_slack_data['user']['id']
+    channel_id = json_slack_data['channel']['id']
+
+    if "value" in json_slack_data["actions"][0]:
+
+        value = json_slack_data["actions"][0]["value"]
+
+        if "+" in value:
+            value = value.replace("+", " ")
+
+        if "\'" in value:
+            value = value.replace("\'", "\"")
+
+        user_data = json.loads(value)
+
+        return invoker_id, invoker, channel_id, user_data
+    return invoker, None
+
+
+def one_click_termination(invoker_id, invoker, channel_id, user_data, phases):
+    sendHiddenSlackMessage(invoker_id, channel_id,
+                           f" Terminating *{user_data['Email']}*.. :terminator-walking:")
+
+    summary = ""
+    for phase in phases:
+        print(phase["action"])
+        phase["response"] = phase["function"](phase["arg"])
+        slackLogging(invoker, phase["action"], phase["response"], user_data)
+        summary = f"{summary} {phase['action']}: {phase['response']}\n"
+
+    return summary
+
+
+def askManager(json_slack_data):
+    title = "Email Forwarding"
+    api_url = 'https://slack.com/api/dialog.open'
+
+    dialog = {
+        "callback_id": "emailForwarding",
+        "title": title,
+        "elements": [
+            {
+                "type": "text",
+                "label": "Email",
+                "name": "forwarding_transfer_email"
+            }
+        ],
+        "notify_on_cancel": "true",
+        "state": json_slack_data["actions"][0]["value"]
+    }
+
+    api_data = {
+        "token": getParameter("offboarding_slack_access_token"),
+        "trigger_id": json_slack_data['trigger_id'],
+        "dialog": json.dumps(dialog)
+    }
+
+    requests.post(api_url, data=api_data)
+
+
+def step_by_step_termination(invoker_id, invoker, channel_id, user_data, action_id, gsuite):
+    sendHiddenSlackMessage(invoker_id, channel_id,
+                           f" Processing *{action_id}*.. :terminator-walking:")
+
+    if action_id == "lockComputer":
+        response = lockComputer(user_data)
+        slackLogging(invoker, action_id, response, user_data)
+    elif action_id == "msgManager":
+        response = imManager(user_data)
+        slackLogging(invoker, action_id, response, user_data)
+    elif action_id == "suspendGoogle":
+        response = gsuite.suspend_google(user_data["Email"])
+        slackLogging(invoker, action_id, response, user_data)
+        time.sleep(5)
+        response = gsuite.check_for_suspension(user_data["Email"])
+        slackLogging(invoker, "checkIfUserSuspended", response, user_data)
+    elif action_id == "createGroup":
+        response = gsuite.check_for_aliases(user_data["Email"])
+        slackLogging(invoker, "Checking for Aliases", response, user_data)
+        response = gsuite.create_forwarding_group(user_data["Email"])
+        slackLogging(invoker, action_id, response, user_data)
+    elif action_id == "deactivateSlack":
+        response = deleteSlackUser(user_data["ID"])
+        slackLogging(invoker, action_id, response, user_data)
+    elif action_id == "removeGit":
+        response = removeGitUser(user_data["Email"])
+        slackLogging(invoker, action_id, response, user_data)
+    elif action_id == "removeZoom":
+        response = deactivateZoom(user_data["Email"])
+        slackLogging(invoker, action_id, response, user_data)
+
+
+def deactivateZoom(email):
+    global ZOOM_STATUS
+
+    url = "https://zoom.us/scim2/Users"
+
+    access_token = getParameter("zoom_offboard_app")
+    auth = "Bearer " + access_token
+
+    headers = {
+        "Authorization": auth,
+        "Content-Type": "application/json"
+    }
+
+    query = {
+        'filter': f'userName eq {email}'
+    }
+
+    response = requests.request(
+        "GET",
+        url,
+        headers=headers,
+        params=query
+    )
+
+    data = response.json()
+
+    print(f"Zoom data: {data}")
+
+    if "Resources" in data and len(data["Resources"]) > 0:
+        user_id = data["Resources"][0]["id"]
+
+        url = f"https://zoom.us/scim2/Users/{user_id}"
+
+        data = {
+            "schemas": [
+                "urn:ietf:params:scim:api:messages:2.0:PatchOp"
+            ],
+            "Operations": [
+                {
+                    "op": "replace",
+                    "value": {
+                        "active": False
+                    }
+                }
+            ]
+        }
+
+        api_request_response = requests.request(
+            "PATCH",
+            url,
+            headers=headers,
+            json=data
+        )
+
+        ZOOM_STATUS = "Still Active" if api_request_response.status_code != 200 else "Suspended"
+
+        return "Failed" if api_request_response.status_code != 200 else "Success"
+    elif 'message' in data:
+        return data['message']
+    else:
+        return f"{email} does not have a zoom account."
+
+
+def getParameter(param_name):
+    session = boto3.Session(region_name='us-east-2')
+    ssm = session.client('ssm')
+    response = ssm.get_parameter(Name=param_name, WithDecryption=True)
+    return response['Parameter']['Value']
+
+
+def lockComputer(user_data):
+    global COMPUTER_LOCK_CODE
+
+    computer_ids = user_data['Computer_ids']
+    pincode = user_data["Pincode"]
+
+    COMPUTER_LOCK_CODE = pincode
+
+    jamf_offboard = getParameter('jamf_offboard_app')
+
+    if len(computer_ids) == 0:
+        return "User does not have a device registered on Jamf"
+    else:
+        for computer_id in computer_ids:
+            api_url_complete = f"https://auth0.jamfcloud.com/JSSResource/computercommands/command/DeviceLock/passcode/{pincode}/id/{computer_id}"
+
+            api_request_response = requests.post(api_url_complete, headers=HEADERS,
+                                                 auth=("offboard_app", jamf_offboard))
+
+    response = get_computer_info(computer_ids)
+    update = get_jira_update("computer_info")
+    log_in_jira(update, user_data)
+    return response
+
+
+def imManager(employee):
+    service_account_file = getParameter("offboarding_service_account_file")
+    gsuite = GSuiteClient(service_account_file)
+    manager = gsuite.get_manager(employee["Email"])
+
+    if manager is not None:
+
+        api_data = {
+            "token": getParameter("offboarding_slack_access_token"),
+            "email": manager
+        }
+
+        print("Getting Manager's Profile")
+        api_request_response = requests.post(SLACK_API, data=api_data)
+
+        if api_request_response.status_code != 200:
+            print("Can't contact the SLACK API :disappointed:")
+        else:
+            slack_profile = api_request_response.json()
+
+            print(slack_profile)
+
+            if not slack_profile["ok"]:
+                return f"Unable to find {employee['Email']}'s manager on Slack."
+
+            manager_id = slack_profile['user']['id']
+
+            blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": ":email: *You have a message from IT* :incoming_envelope: "
+                    }
+                },
+                {
+                    "type": "divider"
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "\nWould you like " + employee[
+                            "Email"] + "'s future emails forwarded to someone on your team? Click *Yes* to input the forwarding email address. "
+                    }
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": "emailForwardingYes",
+                            "text": {
+                                "type": "plain_text",
+                                "emoji": True,
+                                "text": "Yes."
+                            },
+                            "style": "primary",
+                            "value": str(employee)
+                        },
+                        {
+                            "type": "button",
+                            "action_id": "emailForwardingNo",
+                            "text": {
+                                "type": "plain_text",
+                                "emoji": True,
+                                "text": "No"
+                            },
+                            "style": "danger",
+                            "value": str(employee)
+                        },
+                    ]
+                },
+                {
+                    "type": "divider"
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "\nIf you would like " + employee[
+                            "Email"] + "'s google drive transferred to someone on your team, please open a ticket via it.help.auth0.net."
+                    }
+                }
+            ]
+
+            blocks = json.dumps(blocks)
+
+            data = {
+                'token': getParameter("offboarding_slack_access_token"),
+                'channel': manager_id,
+                'blocks': blocks,
+            }
+
+            api_request_response = requests.post(url='https://slack.com/api/chat.postMessage', data=data)
+
+            response = api_request_response.json()
+
+            return f"Message sent to {manager} on Slack" if response["ok"] else response
+
+    return f"Unable to get {employee['Email']}'s manager."
+
+
+def deleteSlackUser(user_id):
+    global SLACK_STATUS
+
+    token = getParameter("offboarding_slack_access_token2")
+    SCIM = "https://api.slack.com/scim/v1"
+    headers = {
+        "Authorization": "Bearer " + token
+    }
+
+    url = SCIM + "/Users/" + str(user_id)
+
+    api_request_response = requests.delete(url, headers=headers)
+
+    SLACK_STATUS = "Still Active" if api_request_response.status_code != 200 else "Suspended"
+
+    return "Failed" if api_request_response.status_code != 200 else "Success"
+
+
+def slackLogging(invoker, service, response, user_data):
+    offboarding = user_data["Email"]
+    message = f"*Invoked by:* {invoker} \n*Offboarding:* {offboarding} \n*Service ID:* {service} \n*Status:* {response}"
+
+    if "lockComputer" in service:
+        pincode = user_data["Pincode"]
+        message = message + f"\n*Pin Code:* {pincode}"
+    if service == "msgManager":
+        service_account_file = getParameter("offboarding_service_account_file")
+        gsuite = GSuiteClient(service_account_file)
+        manager = gsuite.get_manager(user_data["Email"])
+        message = message + f"\n*Manager:* *{manager}*"
+
+    data = {
+        'token': getParameter("offboarding_slack_access_token"),
+        'channel': log_channel,
+        'text': message
+    }
+
+    requests.post(url='https://slack.com/api/chat.postMessage', data=data)
+
+
+def sendSlackMessage(to, message):
+    data = {
+        'token': getParameter("offboarding_slack_access_token"),
+        'channel': to,
+        'text': message
+    }
+
+    requests.post(url='https://slack.com/api/chat.postMessage', data=data)
+
+
+def sendHiddenSlackMessage(user, channel_id, message):
+    data = {
+        'token': getParameter("offboarding_slack_access_token"),
+        'channel': channel_id,
+        'user': user,
+        'text': message
+    }
+
+    requests.post(url='https://slack.com/api/chat.postEphemeral', data=data)
+
+
+def removeGitUser(email):
+    print("Removing Git")
+    github = GithubClient()
+    github_id = None
+    service_account_file = getParameter("offboarding_service_account_file")
+    gsuite = GSuiteClient(service_account_file)
+    user_gdata = gsuite.get_user(email)
+    response = ""
+
+    if "externalIds" in user_gdata and len(user_gdata["externalIds"]) > 0:
+        for item in user_gdata["externalIds"]:
+            if item["type"] == "custom":
+                if item["customType"] == "github":
+                    github_id = item["value"]
+                    print(f'Github ID {github_id}')
+
+    if github_id is not None:
+        username = github.get_user(github_id)["login"]
+
+        if username is not None:
+            print(username)
+            membership = github.checkOrgMembership(username)
+            if membership:
+                print(str(membership))
+                for org in membership:
+                    response = response + github.remove_member_from_org(username, org) + "\n"
+                return response
+            return f"{email} does not belong in any Github Auth0 organizations."
+    else:
+        return f"{email} does not have a github id."
+
+
+def get_dialog_submission(json_slack_data):
+    print(str(json_slack_data))
+    manager = json_slack_data["user"]["name"]
+    value = json_slack_data["state"]
+
+    if "+" in value:
+        value = value.replace("+", " ")
+
+    if "\'" in value:
+        value = value.replace("\'", "\"")
+
+    if value:
+        user_data = json.loads(value)
+
+        if "forwarding_transfer_email" in json_slack_data["submission"]:
+            forwarding_transfer_email = json_slack_data["submission"]["forwarding_transfer_email"]
+
+            if "@company.com" in forwarding_transfer_email:
+                global FORWARD_MAIL, FORWARDING_ADDRESS, FORWARD_MAIL_STATUS
+
+                service_account_file = getParameter("offboarding_service_account_file")
+                gsuite = GSuiteClient(service_account_file)
+                response = gsuite.addtoforwardinggroup(user_data["Email"], forwarding_transfer_email)
+
+                slackLogging(manager, f"emailForwarding: {forwarding_transfer_email}", response, user_data)
+
+                sendSlackMessage(f"@{manager}",
+                                 f"Thank you. We received your request.")
+
+                FORWARD_MAIL = "yes"
+                FORWARDING_ADDRESS = forwarding_transfer_email
+                FORWARD_MAIL_STATUS = "active" if response == "Success" else "[inactive/active]"
+
+                update = get_jira_update("google_account_transfer")
+                log_in_jira(update, user_data)
+
+
+def log_in_jira(comment, user_data):
+    auth = HTTPBasicAuth("bouncer@company.com", "H49SlFXYQtsf0u4smbCz49A9")
+
+    name = user_data["Name"]
+    name = name.replace(" ", " AND summary ~ ")
+
+    url = "https://companyteam.atlassian.net/rest/api/3/search"
+
+    payload = json.dumps({
+        "expand": [
+            "names",
+            "schema",
+            "operations"
+        ],
+        "jql": f"project = IH AND summary ~ 'Termination' AND summary ~ {name}",
+        "maxResults": 15,
+        "fieldsByKeys": False,
+        "fields": [
+            "summary",
+            "status",
+            "assignee"
+        ],
+        "startAt": 0
+    })
+
+    response = requests.request(
+        "POST",
+        url,
+        headers=HEADERS,
+        data=payload,
+        auth=auth
+    )
+
+    data = json.loads(response.text)
+
+    if "issues" in data:
+        comment_url = f'https://companyteam.atlassian.net/rest/api/2/issue/{data["issues"][0]["key"]}/comment'
+
+        body = json.dumps({
+            "body": comment,
+            "visibility": {
+                "type": "role",
+                "value": "Administrators"
+            }
+        })
+
+        requests.request(
+            "POST",
+            comment_url,
+            headers=HEADERS,
+            data=body,
+            auth=auth
+        )
+
+
+def get_computer_info(computer_ids):
+    global COMPUTER_STATUS, COMPUTER_SERIAL_NUMBER
+    jamf_readonly = getParameter('jamf_slackapp_readonly')
+    serial_numbers = []
+    locked = 0
+
+    if len(computer_ids) > 0:
+        for computer_id in computer_ids:
+
+            url = f"https://company.jamfcloud.com/JSSResource/computers/id/{computer_id}"
+
+            api_request_response = requests.get(url,
+                                                headers={'Accept': 'application/json',
+                                                         'Content-type': 'application/json'},
+                                                auth=("slack_app", jamf_readonly))
+
+            data_from_jamf = api_request_response.json()
+
+            if data_from_jamf['computer']['security']['activation_lock']:
+                locked = locked + 1
+
+            serial_numbers.append(data_from_jamf['computer']['general']['serial_number'])
+
+    COMPUTER_STATUS = f"{locked}/{len(computer_ids)} Locked"
+    COMPUTER_SERIAL_NUMBER = str(serial_numbers) if len(serial_numbers) > 0 else "Not Found"
+
+    return "Success" if locked == len(serial_numbers) else "Fail"
+
+
+def get_jira_update(update):
+    if update == "checklist":
+        update = f'''
+        \n*Account Status Updates:* 
+        • Slack: {SLACK_STATUS}
+        • Zoom: {ZOOM_STATUS}
+        • Google Account: {GOOGLE_ACCOUNT}
+        '''
+    elif update == "computer_info":
+        update = f'''
+        \n*Computer Info:*
+        • Computer Status: {COMPUTER_STATUS}
+        • Computer Lock Code: {COMPUTER_LOCK_CODE}
+        • Computer Serial Number: {COMPUTER_SERIAL_NUMBER}
+        '''
+    elif update == "google_account_transfer":
+        update = f'''
+        \n*Google Mail Transfer:*
+        • Email Forwarding Requested: {FORWARD_MAIL} 
+        • Who are you forwarding the information to? {FORWARDING_ADDRESS}
+        • E-mail Forwarding Status: {FORWARD_MAIL_STATUS}        
+        '''
+
+    return update
