@@ -1,0 +1,497 @@
+import json
+import requests
+import boto3
+import base64
+from botocore.exceptions import ClientError
+import time
+from datetime import datetime
+
+# Slack API URL
+SLACK_API = "https://slack.com/api/users.lookupByEmail"
+
+# Jamf Pro API URL
+JAMF_URL = "https://company.jamfcloud.com/JSSResource/computers/match/"
+
+SLACK_CHANNELS = ["xxx", "xxx"]
+
+jamf_error= None 
+
+employee = {}
+employee.clear()
+employee["Name"] = ""
+employee["Title"] =""
+employee["Department"] =""
+employee["Email"] = ""
+employee["ID"] = ""
+employee["Team_ID"] = ""
+employee["Computer_ids"] = ""
+employee["Pincode"] = "xxx"
+employee["Image"] = "https: default pic"
+
+HEADERS = {
+        'Accept': 'application/json',
+        'Content-type': 'application/json',
+}  
+
+def lambda_handler(event, context):
+    
+    data_from_slack = event["Records"][0]["Sns"]["Message"]
+    
+    json_loaded_data = json.loads(data_from_slack)
+    
+    response_url = json_loaded_data["response_url"]
+    channel_id = json_loaded_data["channel_id"]
+    search_string = json_loaded_data["text"]
+
+    search_handler(channel_id, response_url, search_string)
+ 
+def search_handler(channel_id, response_url, search_string):
+    
+    response_json = {}
+        
+    # Verify that the request is coming from the right slack channel
+    if (channel_id in SLACK_CHANNELS):
+        api_url_complete = JAMF_URL + search_string
+        
+        
+        # Get Jamf Pro read only credentials
+        jamf_readonly = getParameter('jamf_slackapp_readonly')
+        jamf_request_response = requests.get(api_url_complete, headers=HEADERS, auth=("slack_app", jamf_readonly))
+
+  
+        if jamf_request_response.status_code != 200:
+        	jamf_error = "Can't contact the Jamf server."
+        else:
+            print("Contacting Jamf")
+            data_from_jamf = jamf_request_response.json()
+            
+            users_device_list = parse_data(data_from_jamf,search_string,response_url)
+            
+            computer_ids=[]
+            
+            if users_device_list:
+            	for device in users_device_list:
+            		computer_ids.append(device["ID"])
+            		
+            employee["Computer_ids"] = computer_ids
+    
+        token = getParameter("slack_test_app_access_token")
+        api_data = {
+            "token": token,
+            "email": search_string
+        }
+        
+        print("Getting Slack Profile")   
+        api_request_response = requests.post(SLACK_API, data=api_data)
+
+        if api_request_response.status_code != 200:
+            response_text = "Can't contact the SLACK API :disappointed:"
+            response_json["text"] = response_text
+            response = requests.post(
+            response_url, data=json.dumps(response_json),
+            headers={'Content-Type': 'application/json'}
+            )
+        else:
+            slack_profile = api_request_response.json()
+            
+            print(slack_profile)
+            
+            if not slack_profile["ok"]:
+                response_text = "Slack User was not found."
+                response_json["text"] = response_text
+                response = requests.post(
+                response_url, data=json.dumps(response_json),
+                headers={'Content-Type': 'application/json'}
+                )
+            else:
+                employee["Name"] = slack_profile['user']['real_name']
+                employee["ID"] = slack_profile['user']['id']
+                employee["Team_ID"] = slack_profile['user']['team_id']
+                employee["Title"] = slack_profile['user']['profile']['title']
+                employee["Email"] = search_string
+                
+                profile_query = {
+                    "token": token,
+                    "user": employee["ID"]
+                }
+                
+                profile_response = requests.post("https://slack.com/api/users.profile.get", data=profile_query)
+                
+                try:
+                    employee["Department"] = profile_response.json()["profile"]["fields"]["XfDW01AH2Q"]["value"]
+                except:
+                    pass
+                    
+                if "image_orginal" in slack_profile["user"]["profile"]:
+                	employee["Image"] = slack_profile["user"]["profile"]["image_orginal"]
+
+                printMessage(response_url)
+                
+    else:
+        response_json["text"] = ":warning: `/command` can only be used from an authorized channel."
+        response = requests.post( 
+            response_url, data=json.dumps(response_json),
+            headers={'Content-Type': 'application/json'}
+            )
+  
+    
+def printMessage(response_url):
+    response_json = {}
+    print("Preparing blocks")
+    
+    if jamf_error is None:
+	    device_count = len(employee["Computer_ids"])
+	    jamf_info = "*Number of Devices:* " + str(device_count)
+	    for count in range(device_count):
+	    	jamf_info = jamf_info + "\n <https://company.jamfcloud.com/computers.html?id=" + str(employee["Computer_ids"][count]) + "| *Jamf URL " + str(count+1) + "* >"
+	    
+    now = datetime.now()
+    blocks = [
+		{
+			"type": "header",
+			"text": {
+				"type": "plain_text",
+				"text": ":checkered_flag:  Employee Exit  :checkered_flag:"
+			}
+		},
+		{
+			"type": "divider"
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "*Name:* " +  employee["Name"] \
+				        + "\n *Title:* " + employee["Title"] \
+				        + "\n *Department:* " + employee["Department"] \
+				        + "\n" + jamf_info
+			},
+			"accessory": {
+				"type": "image",
+				"image_url": employee["Image"],
+				"alt_text": "Head Shot"
+			}
+		},
+		{
+			"type": "divider"
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": ":clickstream:*Things to complete manually:*:clickstream:"
+			}
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "The following buttons will take you to where you need to be.",
+				"verbatim": False 
+			}
+		},
+		{
+			"type": "divider"
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Open a Revoke request in Phenix" 
+			},
+			"accessory": {
+                "type": "button",
+                "action_id": "revokePhenix",
+                "text": {
+                    "type": "plain_text",
+					"emoji": True,
+					"text": ":phoenix2:"
+                },
+                "url": "https://company.phenix.rocks/users/google-apps|" + employee["Email"] 
+			}
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Block User from company.com" 
+			},
+			"accessory": {
+                "type": "button",
+                "action_id": "blockfromcompany",
+                "text": {
+                    "type": "plain_text",
+                    "text": ":no_entry_sign:"
+                },
+                "url": "https://manage.company.com/dashboard/us/companycorp/",
+			}
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Block User from companycorp.com" 
+			},
+			"accessory": {
+                "type": "button",
+                "action_id": "blockfromcompanycorp",
+                "text": {
+                    "type": "plain_text",
+                    "text": ":no_entry_sign:"
+                },
+                "url": "https://manage.companycorp.com/dashboard/pi/iam/"
+			}
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Revoke Permissions on Bouncer" 
+			},
+			"accessory": {
+                "type": "button",
+                "action_id": "revokePermissions",
+                "text": {
+                    "type": "plain_text",
+                    "text": ":no_entry_sign:"
+                },
+                "url": "https://bouncer.company.net/offboarding"
+			}
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Fulfill any Revoke requests that are assigned to IT" 
+			},
+			"accessory": {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+					"emoji": True,
+					"text": ":done:"
+                },
+                "url": "https://company.phenix.rocks/requests"
+			}
+		},
+		{
+			"type": "divider"
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": ":gear:*Things done for you automatically!*:gear:"
+			}
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Select the following buttons in order and check the it-offboarding channel for a response.",
+				"verbatim": False 
+			}
+		},
+		{
+			"type": "divider"
+		},
+				{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Suspend Google Account" 
+			},
+			"accessory": {
+				"type": "button",
+				"action_id": "suspendGoogle",
+				"text": {
+					"type": "plain_text",
+					"emoji": True,
+					"text": ":google:"
+				},
+				"value": str(employee)
+			}
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Lock Computer with Preset PIN"
+			},
+			"accessory": {
+				"type": "button",
+				"action_id": "lockComputer",
+				"text": {
+					"type": "plain_text",
+					"emoji": True,
+					"text": ":lock:"
+				},
+				"value": str(employee)
+			}
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Deactivate Slack" 
+			},
+			"accessory": {
+                "type": "button",
+                "action_id": "deactivateSlack",
+                "text": {
+                    "type": "plain_text",
+					"emoji": True,
+					"text": ":slack:"
+                },
+                "value": str(employee)
+			}
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Remove from GitHub" 
+			},
+			"accessory": {
+                "type": "button",
+                "action_id": "removeGit",
+                "text": {
+                    "type": "plain_text",
+					"emoji": True,
+					"text": ":github3:"
+                },
+                "value": str(employee)
+			}
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Deactivate Zoom" 
+			},
+			"accessory": {
+                "type": "button",
+                "action_id": "removeZoom",
+                "text": {
+                    "type": "plain_text",
+					"emoji": True,
+					"text": ":zoom:"
+                },
+                "value": str(employee)
+			}
+		},		
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Create Forwarding Group" 
+			},
+			"accessory": {
+				"type": "button",
+				"action_id": "createGroup",
+				"text": {
+					"type": "plain_text",
+					"emoji": True,
+					"text": ":google:"
+				},
+				"value": str(employee)
+			}
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "IM Manager" 
+			},
+			"accessory": {
+				"type": "button",
+				"action_id": "msgManager",
+				"text": {
+					"type": "plain_text",
+					"emoji": True,
+					"text": ":envelope_with_arrow:"
+				},
+				"value": str(employee)
+			}
+		},
+		{
+			"type": "divider"
+		},
+
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "Select this ONLY if you haven't already selected the above automations.",
+				"verbatim": False 
+			}
+		},
+		{
+			"type": "divider"
+		},
+		{
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": "*ALL THE ABOVE AUTOMATIONS*" 
+			},
+			"accessory": {
+				"type": "button",
+				"action_id": "select_all",
+				"text": {
+					"type": "plain_text",
+					"emoji": True,
+					"text": ":ohyeah:"
+				},
+				"value": str(employee)
+			}
+		}
+	]
+    
+    response_json = {'blocks' : blocks}
+	
+    response = requests.post(
+    response_url, data=json.dumps(response_json),
+    headers={'Content-Type': 'application/json'}
+    )
+
+def parse_data(data, search_string, url):   
+    
+    response_json = {}
+
+    size = len(data["computers"])
+    
+    # If there are more than 20 results then ask user to refine their search string
+    if size > 20:
+        response_json["text"] = ":warning: More than 20 results."
+        response = requests.post(
+            url, data=json.dumps(response_json),
+            headers={'Content-Type': 'application/json'}
+            )
+    elif size == 0: # no results found
+        response_json["text"] = ":sadparrot: No devices found for " + search_string
+        response = requests.post(
+            url, data=json.dumps(response_json),
+            headers={'Content-Type': 'application/json'}
+            )
+        return 0
+    else:
+        computers = data["computers"]
+        computer_list = []
+
+        for computer in computers:
+            result = {
+            "Serial_Number" : computer["serial_number"],
+            "ID" : computer["id"],
+            "Username" : computer["username"]
+            }
+            computer_list.append(result)
+            
+        return computer_list
+       
+    
+def getParameter(param_name):
+    session = boto3.Session(region_name='us-east-2')
+    ssm = session.client('ssm')
+    response = ssm.get_parameter(Name=param_name,WithDecryption=True)
+    return response['Parameter']['Value']
