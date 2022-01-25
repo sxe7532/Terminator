@@ -1,0 +1,265 @@
+import json
+import requests
+import boto3
+import base64
+from botocore.exceptions import ClientError
+import time
+from datetime import datetime
+import re
+
+# Slack API URL
+SLACK_API = "https://slack.com/api/users.lookupByEmail"
+
+# Jamf Pro API URL
+JAMF_URL = "https://company.jamfcloud.com/JSSResource/computers/match/"
+
+SLACK_CHANNELS = ["xxx", "xxx", "xxx"]
+
+jamf_error= None 
+
+channel = "#channel_name"
+username = 'Terminator'
+
+employee = {}
+employee.clear()
+employee["Name"] = ""
+employee["Title"] =""
+employee["Department"] =""
+employee["Email"] = ""
+employee["ID"] = ""
+employee["Team_ID"] = ""
+employee["Computer_ids"] = ""
+employee["Pincode"] = "123456"
+employee["Image"] = "https://ca.slack-edge.com/T025590N6-U01BVV3TL9W-53c553850137-512"
+
+HEADERS = {
+        'Accept': 'application/json',
+        'Content-type': 'application/json',
+}  
+
+def lambda_handler(event, context):
+    
+    data_from_slack = event["Records"][0]["Sns"]["Message"]
+    
+    json_loaded_data = json.loads(data_from_slack)
+
+    search_handler(json_loaded_data)
+ 
+def search_handler(json_loaded_data):
+    
+    response_url = json_loaded_data["response_url"]
+    channel_id = json_loaded_data["channel_id"]
+    search_string = json_loaded_data["text"]
+    
+    response_json = {}
+    
+    print(f"Search_string:{search_string}")
+    
+    email = re.search(r'[\w\.-]+@company\.com', search_string)
+    pincode = re.search(r'[0-9]{6}', search_string)
+    
+    if email is not None:
+        email = email.group(0)
+    else:
+        response_json["text"] = "Missing email. Syntax: `/terminate someone@company.com"
+        response = requests.post( 
+            response_url, data=json.dumps(response_json),
+            headers={'Content-Type': 'application/json'}
+            )
+    
+    if pincode is not None:
+        employee["Pincode"] = pincode.group(0)
+    else:
+        response_json["text"] = "No 6 digit pincode provided. Default pincode will be used instead."
+        response = requests.post( 
+            response_url, data=json.dumps(response_json),
+            headers={'Content-Type': 'application/json'}
+            )
+
+    # Verify that the request is coming from the right slack channel
+    if (channel_id in SLACK_CHANNELS):
+        print(json_loaded_data)
+        
+        api_url_complete = JAMF_URL + email
+        
+        # Get Jamf Pro read only credentials
+        jamf_readonly = getParameter('jamf_slackapp_readonly')
+        jamf_request_response = requests.get(api_url_complete, headers=HEADERS, auth=("slack_app", jamf_readonly))
+  
+        if jamf_request_response.status_code != 200:
+        	jamf_error = "Can't contact the Jamf server."
+        else:
+            print("Contacting Jamf")
+            data_from_jamf = jamf_request_response.json()
+            
+            users_device_list = parse_data(data_from_jamf,email,response_url)
+            
+            computer_ids=[]
+            
+            if users_device_list:
+            	for device in users_device_list:
+            		computer_ids.append(device["ID"])
+            		
+            employee["Computer_ids"] = computer_ids
+    
+        token = getParameter("slack_test_app_access_token")
+        api_data = {
+            "token": token,
+            "email": email
+        }
+        
+        print("Getting Slack Profile")   
+        api_request_response = requests.post(SLACK_API, data=api_data)
+
+        if api_request_response.status_code != 200:
+            response_json["text"] = "Can't contact the SLACK API :disappointed:"
+            response = requests.post( 
+                response_url, data=json.dumps(response_json),
+                headers={'Content-Type': 'application/json'}
+                )
+        else:
+            slack_profile = api_request_response.json()
+            
+            print(slack_profile)
+            
+            if not slack_profile["ok"]:
+                response_json["text"] = "Slack User was not found."
+                response = requests.post( 
+                    response_url, data=json.dumps(response_json),
+                    headers={'Content-Type': 'application/json'}
+                    )
+            else:
+                employee["Name"] = slack_profile['user']['real_name']
+                employee["ID"] = slack_profile['user']['id']
+                employee["Team_ID"] = slack_profile['user']['team_id']
+                employee["Title"] = slack_profile['user']['profile']['title']
+                employee["Email"] = email
+                
+                profile_query = {
+                    "token": token,
+                    "user": employee["ID"]
+                }
+                
+                profile_response = requests.post("https://slack.com/api/users.profile.get", data=profile_query)
+                
+                try:
+                    employee["Department"] = profile_response.json()["profile"]["fields"]["XfDW01AH2Q"]["value"]
+                except:
+                    pass
+                    
+                if "image_orginal" in slack_profile["user"]["profile"]:
+                	employee["Image"] = slack_profile["user"]["profile"]["image_orginal"]
+                	
+
+                printMessage(response_url, json_loaded_data)
+                
+    else:
+        response_json["text"] = ":warning: `/terminate` can only be used from an authorized channel."
+        response = requests.post( 
+            response_url, data=json.dumps(response_json),
+            headers={'Content-Type': 'application/json'}
+            )
+  
+    
+def printMessage(response_url, json_loaded_data):
+    attachments = json.dumps([
+       {
+           "text": "Do you want me to terminate the following account?\n" + employee["Email"],
+           "fallback": "We are unable to terminate the account",
+           "callback_id": "terminate_account",
+           "color": "#3AA3E3",
+           "attachment_type": "default",
+           "actions": [
+               {
+                   "id": "select_all",
+                   "name": "Yes",
+                   "text": "Yes, terminate account",
+                   "style": "primary",
+                   "type": "button",
+                   "value": str(employee)
+               },
+               {
+                   "name": "No",
+                   "text": "No",
+                   "type": "button",
+                   "style": "danger",
+                   "value": "no",
+                   "confirm": {
+                     "title": "Please confirm: ",
+                     "text": "Are you sure you don't want me to terminate this account?",
+                     "ok_text": "Yes",
+                     "dismiss_text": "No"
+                   }
+               }
+           ]
+       }
+    ])
+    
+    
+    sendHiddenSlackMessage("Time to terminate! :terminator-walking:", json_loaded_data['user_id'], attachments)
+
+def parse_data(data, search_string, url):   
+    
+    response_json = {}
+
+    size = len(data["computers"])
+    
+    # If there are more than 20 results then ask user to refine their search string
+    if size > 20:
+        response_json["text"] = ":warning: More than 20 results."
+        response = requests.post(
+            url, data=json.dumps(response_json),
+            headers={'Content-Type': 'application/json'}
+            )
+    elif size == 0: # no results found
+        response_json["text"] = ":sadparrot: No devices found for " + search_string
+        response = requests.post(
+            url, data=json.dumps(response_json),
+            headers={'Content-Type': 'application/json'}
+            )
+        return 0
+    else:
+        computers = data["computers"]
+        computer_list = []
+
+        for computer in computers:
+            result = {
+            "Serial_Number" : computer["serial_number"],
+            "ID" : computer["id"],
+            "Username" : computer["username"]
+            }
+            computer_list.append(result)
+            
+        return computer_list
+       
+    
+def getParameter(param_name):
+    session = boto3.Session(region_name='us-east-2')
+    ssm = session.client('ssm')
+    response = ssm.get_parameter(Name=param_name,WithDecryption=True)
+    return response['Parameter']['Value']
+    
+def sendSlackMessage(message, attachments = None):
+
+    data = {
+        'token': token,
+        'channel': channel,    
+        'text': message,
+        'attachments' : attachments,
+        'username': username
+    }
+
+    response = requests.post(url='https://slack.com/api/chat.postMessage', data=data)
+    
+    print(response.json())
+    
+def sendHiddenSlackMessage(message, user, attachments = None):
+    data = {
+        'token': getParameter("offboarding_slack_access_token"),
+        'channel': channel,
+        'text': message,
+        'attachments' : attachments,
+        'user': user
+    }
+
+    requests.post(url='https://slack.com/api/chat.postEphemeral', data=data)
