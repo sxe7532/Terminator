@@ -1,0 +1,82 @@
+import json
+import hashlib
+import hmac
+import boto3
+from botocore.exceptions import ClientError
+import base64
+from urllib import parse as urlparse
+import time
+import os
+
+helper_text = """
+Syntax: `/offboard <email>
+"""
+# Simple notification service ARN
+SNS_TOPIC_ARN = 'arn:aws:sns:us-east-2:xxxxxx:offboard_app_activate_sns'
+#SLACK_CHANNEL_ID = os.environ['SLACK_CHANNEL_ID']
+SLACK_CHANNELS = ["xxx", "xxx"]
+
+def lambda_handler(event, context):
+    
+    request_body = event["body"]
+    request_body_parsed = dict(urlparse.parse_qsl(request_body))
+
+    
+    channel_id = request_body_parsed["channel_id"]
+    
+    if (channel_id in SLACK_CHANNELS):
+        
+        delivered_signature = event["headers"]['X-Slack-Signature']
+
+        slack_request_timestamp = event["headers"]['X-Slack-Request-Timestamp']
+
+        slack_signing_secret = getParameter("slack_test_app_signing_secret")
+        
+        basestring = f"v0:{slack_request_timestamp}:{request_body}".encode('utf-8')
+        
+        slack_signing_secret = bytes(slack_signing_secret, 'utf-8')
+        expected_signature = 'v0=' + hmac.new(slack_signing_secret, basestring, hashlib.sha256).hexdigest()
+            
+        current_time = time.time()
+        slack_request_timestamp_asFloat = float(slack_request_timestamp)
+        if (current_time - slack_request_timestamp_asFloat) > 300:
+            response_text = "Message more than 5 minutes old"
+            response_code = 412
+        # Confirm that delivered signature is the same as the expected_signature
+        elif hmac.compare_digest(expected_signature, delivered_signature):    
+            try: 
+                search_string = request_body_parsed["text"]
+            except KeyError:
+        	    # catches if no search string parameter is provided
+                search_string = ""
+            # hooray, signature strings match, the request came from Slack!
+            if "@auth0.com" not in search_string or search_string == "" or search_string == "help":
+                response_text = helper_text
+                response_code = 200
+            else: 
+                slack_ready_search_string = search_string.replace("*","\u034F*")
+                response_text = ":female-detective::skin-tone-3: looking up _" + slack_ready_search_string + "_..."
+                response_code = 200
+                # Publish to the SNS topic
+                client = boto3.client('sns')
+                print("Publishing to SNS")
+                trigger = client.publish(TargetArn = SNS_TOPIC_ARN,Message=json.dumps({'default': json.dumps(request_body_parsed)}),MessageStructure='json') 
+        else:
+            response_text = "Message signature is invalid"
+            response_code = 412
+    else:
+        response_text = ":warning: You must use `/offboard` while inside the private-it-team channel."
+        # Returning status code of 200 so that response text is presented to user
+        response_code = 200
+
+    return {
+        'statusCode': response_code,
+        'body': response_text
+    }
+    
+            
+def getParameter(param_name):
+    session = boto3.Session(region_name='us-east-2')
+    ssm = session.client('ssm')
+    response = ssm.get_parameter(Name=param_name,WithDecryption=True)
+    return response['Parameter']['Value']
