@@ -1,0 +1,183 @@
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+from googleapiclient.errors import HttpError
+import json
+import time
+
+class GSuiteClient:
+    SERVICE_ID = 'gsuite'
+
+    SCOPES = [
+        'https://www.googleapis.com/auth/admin.directory.user',
+        'https://www.googleapis.com/auth/admin.directory.group',
+        'https://mail.google.com',
+        'https://www.googleapis.com/auth/gmail.settings.sharing'
+    ]
+
+    RETRIES = 0
+
+    def __init__(self, service_account_file):
+        service_account_file = json.loads(service_account_file)
+        self.creds = service_account.Credentials.from_service_account_info(service_account_file, scopes=self.SCOPES)
+        self.directory = build('admin', 'directory_v1',
+                               credentials=self.creds.with_subject(service_account_file['assumed_subject_email']))
+
+    @classmethod
+    def normalize_group_key(cls, raw_group_id: str) -> str:
+        """Translates group id into valid Google Group Key"""
+        group_slug = raw_group_id.replace(":", "-").lower()
+
+        return group_slug
+
+
+    def addtoforwardinggroup(self, employee_email, forwarding_email):
+        payload = {
+            "email": forwarding_email
+        }
+
+        try:
+            response = self.directory.members().insert(groupKey=employee_email, body=payload).execute(num_retries=self.RETRIES)
+            if response['status'] == 'ACTIVE':
+                return "Success"
+            return response
+        except HttpError as e:
+            error = "Error in addtoforwardinggroup"
+            if e._get_reason():
+                error = f"{error}: {e._get_reason()}"
+            return error
+
+    def get_user(self, employee_email):
+        user_data = {}
+
+        try:
+            try:
+                user_data = self.directory.users().get(userKey=employee_email).execute(num_retries=self.RETRIES)
+            except:
+                employee_email = employee_email.replace("@company.com", "-suspended@company.com")
+                user_data = self.directory.users().get(userKey=employee_email).execute(num_retries=self.RETRIES)
+        except HttpError as e:
+            error = "Error in get_user"
+            if e._get_reason():
+                error = f"{error}: {e._get_reason()}"
+
+        return user_data if user_data else None
+
+    def check_for_suspension(self, employee_email):
+        user_data = {}
+
+        try:
+            try:
+                user_data = self.directory.users().get(userKey=employee_email).execute(num_retries=self.RETRIES)
+            except:
+                employee_email = employee_email.replace("@company.com", "-suspended@company.com")
+                user_data = self.directory.users().get(userKey=employee_email).execute(num_retries=self.RETRIES)
+        except HttpError as e:
+            error = "Error in get_user"
+            if e._get_reason():
+                error = f"{error}: {e._get_reason()}"
+
+        return "Suspended" if user_data["suspended"] else "Still Active"
+
+    def suspend_google(self, employee_email):
+        name = employee_email.replace("@company.com", "")
+        new_email = f"{name}-suspended@company.com"
+
+        info = {
+            "suspended": True,
+            "orgUnitPath": "/Suspended Accounts",
+            "primaryEmail": new_email
+        }
+
+        try:
+            response = self.directory.users().update(userKey=employee_email, body=info).execute()
+            time.sleep(5)
+            return "Success" if response['suspended'] else "Failed"
+        except HttpError as e:
+            error = "Error in suspend_google"
+            if e._get_reason() == "Resource Not Found: userKey":
+                error = f"Resource Not Found: {employee_email}. User may already be suspended."
+            elif e._get_reason():
+                error = f"{error}: {e._get_reason()}"
+            return error
+
+    def check_for_aliases(self, employee_email):
+        name = employee_email.replace("@company.com", "")
+        new_email = f"{name}-suspended@company.com"
+
+        try:
+            user_data = self.directory.users().get(userKey=new_email).execute(num_retries=self.RETRIES)
+
+            if "aliases" in user_data:
+                if len(user_data["aliases"]) > 0:
+                    response = self.remove_alias(new_email, user_data["aliases"])
+                    return response
+            return "No aliases were found."
+        except HttpError as e:
+            error = "Error in suspend_google"
+            if e._get_reason() == "Resource Not Found: userKey":
+                error = f"Resource Not Found: {employee_email}. User may already be suspended."
+            elif e._get_reason():
+                error = f"{error}: {e._get_reason()}"
+            return error
+
+    def remove_alias(self, new_email, aliases):
+        response = ""
+        try:
+            for alias in aliases:
+                response = response + f"Removed alias {alias} from {new_email}" + "\n"
+                self.directory.users().aliases().delete(userKey=new_email, alias=alias).execute()
+            return response
+        except HttpError as e:
+            error = "Error in remove_alias"
+            if e._get_reason():
+                error = f"{error}: {e._get_reason()}"
+            return error
+
+    def get_manager(self, employee_email):
+
+        print(f"Getting {employee_email} 's manager.")
+
+        try:
+            user_data = self.directory.users().get(userKey=employee_email).execute(num_retries=self.RETRIES)
+        except HttpError as e:
+            try:
+                employee_email = employee_email.replace("@company.com", "-suspended@company.com")
+                user_data = self.directory.users().get(userKey=employee_email).execute(num_retries=self.RETRIES)
+            except HttpError as e:
+                error = "Error in get_manager"
+                if e._get_reason():
+                    error = f"{error}: {e._get_reason()}"
+                return error
+
+        manager_email = user_data["relations"][0]['value']
+
+        return manager_email if manager_email else None
+
+    def create_forwarding_group(self, employee_email):
+        name = employee_email.replace("@company.com", "")
+        new_email = f"{name}-suspended@company.com"
+
+        try:
+            self.remove_alias(new_email, [employee_email])
+        except HttpError as e:
+            error = "Error in create_forwarding_group and removing alias"
+            if e._get_reason():
+                error = f"{error}: {e._get_reason()}"
+
+        payload = {
+            "email": employee_email,
+            "name": f"{employee_email} Forwarding Group"
+        }
+
+        try:
+            response = self.directory.groups().insert(body=payload).execute(num_retries=self.RETRIES)
+
+            if response['adminCreated']:
+                return "Success"
+            return response
+        except HttpError as e:
+            error = "Error in create_forwarding_group"
+            if e._get_reason():
+                error = f"{error}: {e._get_reason()}"
+            return error
+
