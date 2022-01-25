@@ -1,0 +1,61 @@
+import json
+import hashlib
+import hmac
+import boto3
+from botocore.exceptions import ClientError
+import base64
+from urllib import parse as urlparse
+import urllib.parse
+import time
+
+# Simple notification service ARN
+SNS_TOPIC_ARN = 'arn:aws:sns:us-east-2:xxx:offboard_app_results_sns'
+
+def lambda_handler(event, context):
+    request_body = event["body"]
+    request_body_parsed = request_body.replace('payload=','', 1)
+    request_body_parsed = urllib.parse.unquote(request_body_parsed)
+    request_body_parsed = request_body_parsed.replace("\\","")
+        
+    request_body_parsed = json.loads(request_body_parsed)
+    
+    print(str(request_body_parsed))
+
+    delivered_signature = event["headers"]['X-Slack-Signature']
+
+    slack_request_timestamp = event["headers"]['X-Slack-Request-Timestamp']
+    
+    # Create hmac signature and return string representation
+    slack_signing_secret = getParameter("secret")
+    slack_signing_secret = bytes(slack_signing_secret, 'utf-8')
+  
+    basestring = f"v0:{slack_request_timestamp}:{request_body}".encode('utf-8')
+    expected_signature = 'v0=' + hmac.new(slack_signing_secret, basestring, hashlib.sha256).hexdigest()
+    
+    # confirm that message is not more than 5 minutes old
+    current_time = time.time()
+    slack_request_timestamp_asFloat = float(slack_request_timestamp)
+    if (current_time - slack_request_timestamp_asFloat) > 300:
+        response_code = 412
+    # Confirm that delivered signature is the same as the expected_signature
+    elif hmac.compare_digest(expected_signature, delivered_signature):   
+        print("Triggering SNS")
+    # hooray, the request came from Slack!
+        response_code = 200
+        # Publish to the SNS topic
+        client = boto3.client('sns')
+        trigger = client.publish(
+        TargetArn= SNS_TOPIC_ARN,
+        Message=json.dumps({'default': json.dumps(request_body_parsed)}),
+        MessageStructure='json') 
+    else:
+        response_code = 412
+    return {
+        'statusCode': response_code
+    }
+    
+def getParameter(param_name):
+    session = boto3.Session(region_name='us-east-2')
+    ssm = session.client('ssm')
+    response = ssm.get_parameter(Name=param_name,WithDecryption=True)
+    return response['Parameter']['Value']
